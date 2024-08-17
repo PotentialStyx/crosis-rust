@@ -58,6 +58,9 @@ type ReqMap = Arc<RwLock<HashMap<String, oneshot::Sender<goval::Command>>>>;
 
 type ChanMap = Arc<RwLock<HashMap<i32, (mpsc::UnboundedSender<goval::Command>, ReqMap)>>>;
 
+#[cfg(feature = "chan_buf")]
+type ChanBuf = Arc<RwLock<HashMap<i32, Vec<goval::Command>>>>;
+
 /// Represents a crosis client similar to <https://github.com/replit/crosis>.
 #[readonly::make]
 pub struct Client {
@@ -86,6 +89,9 @@ pub struct Client {
 
     channel_map: ChanMap,
 
+    #[cfg(feature = "chan_buf")]
+    channel_buffer: ChanBuf,
+
     /// Uhhhhh, pain
     fetcher: Box<dyn ConnectionMetadataFetcher + Sync + Send>,
 }
@@ -97,6 +103,8 @@ impl Client {
             closer: None,
             writer: None,
             channel_map: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(feature = "chan_buf")]
+            channel_buffer: Arc::new(RwLock::new(HashMap::new())),
             status: Arc::new(RwLock::new(ConnectionStatus::Disconnected)),
         }
     }
@@ -158,6 +166,8 @@ impl Client {
             msgrecv,
             self.channel_map.clone(),
             connection,
+            #[cfg(feature = "chan_buf")]
+            self.channel_buffer.clone(),
         ));
 
         loop {
@@ -268,6 +278,27 @@ impl Client {
         drop(self);
         Ok(())
     }
+
+    #[cfg(feature = "chan_buf")]
+    pub async fn poke_buf(&self) {
+        let mut channel_buffer = self.channel_buffer.write().await;
+        let channel_map = self.channel_map.read().await;
+
+        let mut remove = vec![];
+
+        for (key, val) in channel_buffer.iter_mut() {
+            if let Some(channel) = channel_map.get(key) {
+                while let Some(cmd) = val.pop() {
+                    channel.0.send(cmd).unwrap();
+                }
+                remove.push(*key);
+            }
+        }
+
+        for rm in remove {
+            channel_buffer.remove(&rm);
+        }
+    }
 }
 
 async fn bg_loop(
@@ -279,6 +310,7 @@ async fn bg_loop(
     connection: tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
+    #[cfg(feature = "chan_buf")] chan_buf: ChanBuf,
 ) {
     let mut lock = status.write().await;
     // TODO: Connecting -> connected
@@ -356,6 +388,17 @@ async fn bg_loop(
                         sender.send(cmd).unwrap();
                         drop(map);
                     } else {
+                        #[cfg(feature = "chan_buf")]
+                        {
+                            let mut writer = chan_buf.write().await;
+                            if let Some(buf) = writer.get_mut(&cmd.channel) {
+                                buf.push(cmd);
+                            } else {
+                                writer.insert(cmd.channel, vec![cmd]);
+                            }
+                        }
+
+                        #[cfg(not(feature = "chan_buf"))]
                         println!("Dropped msg... {cmd:#?}");
                     }
                     // println!("rx1 completed first with {:?}", val);
@@ -468,7 +511,7 @@ impl Channel {
         self.client_send.send(msg.encode_to_vec()).unwrap();
     }
 
-    pub async fn request(&self, mut msg: goval::Command) -> Result<goval::Command, ()> {
+    pub async fn request(&self, mut msg: goval::Command) -> goval::Command {
         let mut reqs = self.req_map.write().await;
 
         // This is to match @replit/crosis, might benchmark and find faster random id
@@ -482,7 +525,27 @@ impl Channel {
 
         self.send(msg).await;
 
-        Ok(recv.await.unwrap())
+        recv.await.unwrap()
+    }
+
+    pub fn close(self) {}
+}
+
+impl Drop for Channel {
+    fn drop(&mut self) {
+        self.client_send
+            .send(
+                goval::Command {
+                    channel: 0,
+                    body: Some(goval::command::Body::CloseChan(goval::CloseChannel {
+                        id: self.id,
+                        action: goval::close_channel::Action::TryClose.into(),
+                    })),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            )
+            .unwrap();
     }
 }
 
