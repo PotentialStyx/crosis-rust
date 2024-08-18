@@ -533,19 +533,18 @@ impl Channel {
 
 impl Drop for Channel {
     fn drop(&mut self) {
-        self.client_send
-            .send(
-                goval::Command {
-                    channel: 0,
-                    body: Some(goval::command::Body::CloseChan(goval::CloseChannel {
-                        id: self.id,
-                        action: goval::close_channel::Action::TryClose.into(),
-                    })),
-                    ..Default::default()
-                }
-                .encode_to_vec(),
-            )
-            .unwrap();
+        // Try to send close channel
+        let _ = self.client_send.send(
+            goval::Command {
+                channel: 0,
+                body: Some(goval::command::Body::CloseChan(goval::CloseChannel {
+                    id: self.id,
+                    action: goval::close_channel::Action::TryClose.into(),
+                })),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        );
     }
 }
 
