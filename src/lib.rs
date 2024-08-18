@@ -1,3 +1,4 @@
+#![deny(clippy::unwrap_used)]
 #![cfg_attr(doc, feature(doc_cfg))]
 use async_trait::async_trait;
 use futures_util::{stream::StreamExt, SinkExt};
@@ -153,8 +154,11 @@ impl Client {
         self.writer = Some(msgsend);
         self.closer = Some(sender.clone());
 
-        let (chan0, chan0_sender) =
-            Channel::new(0, self.status.clone(), self.writer.clone().unwrap());
+        let (chan0, chan0_sender) = Channel::new(
+            0,
+            self.status.clone(),
+            self.writer.clone().expect("This has to be Some()"),
+        );
         let mut lck = self.channel_map.write().await;
         lck.insert(0, (chan0_sender, chan0.req_map.clone()));
         drop(lck);
@@ -178,7 +182,7 @@ impl Client {
             tokio::task::yield_now().await;
         }
 
-        // println!("READY");
+        // eprintln!("READY");
         Ok(chan0)
     }
 
@@ -188,7 +192,17 @@ impl Client {
                 Err(CrosisError::Disconnected("send message".to_string()))
             }
             _ => {
-                self.closer.as_ref().unwrap().send(()).unwrap();
+                if let Some(closer) = self.closer.as_ref() {
+                    if closer.send(()).is_err() {
+                        return Err(CrosisError::GenericError(
+                            "Close sender failed to send".to_string(),
+                        ));
+                    }
+                } else {
+                    return Err(CrosisError::GenericError(
+                        "Close sender failed to exist".to_string(),
+                    ));
+                }
                 Ok(())
             }
         }
@@ -201,12 +215,17 @@ impl Client {
                 Err(CrosisError::Disconnected("send message".to_string()))
             }
             _ => {
-                // Writer wont be closed if client isnt disconnected
-                self.writer
-                    .as_ref()
-                    .unwrap()
-                    .send(msg.encode_to_vec())
-                    .unwrap();
+                if let Some(writer) = self.writer.as_ref() {
+                    if writer.send(msg.encode_to_vec()).is_err() {
+                        return Err(CrosisError::GenericError(
+                            "Writer failed to send message".to_string(),
+                        ));
+                    }
+                } else {
+                    return Err(CrosisError::GenericError(
+                        "Writer failed to exist".to_string(),
+                    ));
+                }
                 Ok(())
             }
         }
@@ -244,7 +263,12 @@ impl Client {
         };
 
         let cmap = self.channel_map.read().await;
-        let mut reqs = cmap.get(&0).unwrap().1.write().await;
+        let mut reqs = cmap
+            .get(&0)
+            .expect("There is always a channel 0")
+            .1
+            .write()
+            .await;
 
         let (send, recv) = oneshot::channel();
         reqs.insert(cmd_ref, send);
@@ -253,14 +277,29 @@ impl Client {
 
         self.send(open_cmd).await?;
 
-        let resp = recv.await.unwrap();
-        // println!("Fun");
+        let resp = match recv.await {
+            Ok(resp) => resp,
+            Err(_) => {
+                return Err(CrosisError::GenericError(
+                    "Open Channel oneshot channel failed to recieve".to_string(),
+                ))
+            }
+        };
+
+        // eprintln!("Fun");
         match resp.clone().body {
             Some(goval::command::Body::OpenChanRes(res)) => match res.state() {
                 goval::open_channel_res::State::Error => Err(CrosisError::GenericError(res.error)),
                 _ => {
-                    let (channel, sender) =
-                        Channel::new(res.id, self.status.clone(), self.writer.clone().unwrap());
+                    let writer = if let Some(writer) = self.writer.clone() {
+                        writer
+                    } else {
+                        return Err(CrosisError::GenericError(
+                            "Writer could not be gotten to create channel...".to_string(),
+                        ));
+                    };
+
+                    let (channel, sender) = Channel::new(res.id, self.status.clone(), writer);
                     let mut lck = self.channel_map.write().await;
                     lck.insert(res.id, (sender, channel.req_map.clone()));
                     drop(lck);
@@ -336,21 +375,27 @@ async fn bg_loop(
                 _msg = read.next() => {
                     let msg = match _msg {
                         None => {
-                            read_abort_sender.send(()).unwrap();
+                            if read_abort_sender.send(()).is_err() {
+                                eprintln!("Read abort sender failed...");
+                            };
                             break
                         }
                         Some(msg) => {
                             match msg {
                                 Err(err) => {
-                                    println!("{}", err);
-                                    read_abort_sender.send(()).unwrap();
+                                    eprintln!("{}", err);
+                                    if read_abort_sender.send(()).is_err() {
+                                        eprintln!("Read abort sender failed...");
+                                    };
                                     break
                                 }
                                 Ok(msg) => match msg {
                                     tokio_tungstenite::tungstenite::Message::Binary(msg) => msg,
                                     _ => {
-                                            println!("ruh roh");
-                                        read_abort_sender.send(()).unwrap();
+                                        eprintln!("ruh roh");
+                                        if read_abort_sender.send(()).is_err() {
+                                            eprintln!("Read abort sender failed...");
+                                        };
                                         break
                                     }
                                 }
@@ -360,8 +405,15 @@ async fn bg_loop(
 
 
                     // if let Some(goval::command::)
-                    // TODO: handle error
-                    let cmd = goval::Command::decode(msg.as_slice()).unwrap();
+                    let cmd = if let Ok(cmd) = goval::Command::decode(msg.as_slice()) {
+                        cmd
+                    } else {
+                        eprintln!("Message decoding aborting reader...");
+                        if read_abort_sender.send(()).is_err() {
+                            eprintln!("Read abort sender failed...");
+                        };
+                        break
+                    };
 
                     if let &Some(goval::command::Body::BootStatus(ref status)) = &cmd.body {
                         if status.stage() == goval::boot_status::Stage::Complete {
@@ -371,24 +423,29 @@ async fn bg_loop(
                             drop(lock);
                         }
                     }
-                    // println!("{cmd:#?}");
+                    // eprintln!("{cmd:#?}");
 
                     let map = chan_map.read().await;
-                    // TODO: handle error
                     if let Some((sender, _reqs)) = map.get(&cmd.channel) {
 
                         if !cmd.r#ref.is_empty() {
 
                             let mut reqs = _reqs.write().await;
 
-                            // println!("{}", reqs.contains_key(&cmd.r#ref));
+                            // eprintln!("{}", reqs.contains_key(&cmd.r#ref));
                             if let Some(req_resp) = reqs.remove(&cmd.r#ref) {
-                                // TODO: handle error
-                                req_resp.send(cmd.clone()).unwrap();
+                                if req_resp.send(cmd.clone()).is_err() {
+                                    eprintln!("Request handler for {} failed to send...", cmd.r#ref)
+                                }
                             }
                         }
 
-                        sender.send(cmd).unwrap();
+                        let channel = cmd.channel;
+
+                        if sender.send(cmd).is_err() {
+                            // TODO: remove from channel map if this occurs
+                            eprintln!("Channel #{} disappeared", channel);
+                        }
                         drop(map);
                     } else {
                         #[cfg(feature = "chan_buf")]
@@ -402,9 +459,9 @@ async fn bg_loop(
                         }
 
                         #[cfg(not(feature = "chan_buf"))]
-                        println!("Dropped msg... {cmd:#?}");
+                        eprintln!("Dropped msg... {cmd:#?}");
                     }
-                    // println!("rx1 completed first with {:?}", val);
+                    // eprintln!("rx1 completed first with {:?}", val);
                 }
             }
         }
@@ -429,21 +486,27 @@ async fn bg_loop(
                 _msg = msgrecv.recv() => {
                     let msg = match _msg {
                         None => {
-                            abort_sender.send(()).unwrap();
+                            if abort_sender.send(()).is_err() {
+                                eprintln!("Abort sender failed to send abort signal (1)")
+                            }
                             break
                         }
                         Some(msg) => msg,
                     };
-                    // println!("{msg:#?}");
+                    // eprintln!("{msg:#?}");
                     if write.send(tokio_tungstenite::tungstenite::Message::Binary(msg)).await.is_err() {
-                        abort_sender.send(()).unwrap();
+                        if abort_sender.send(()).is_err() {
+                            eprintln!("Abort sender failed to send abort signal (2)")
+                        }
                         break
                     }
                 }
                 _ = tokio::time::sleep(ping_interval) => {
                     // TODO: generate ref attr on the fly
                     if write.send(tokio_tungstenite::tungstenite::Message::Binary(ping_msg.clone())).await.is_err() {
-                        abort_sender.send(()).unwrap();
+                        if abort_sender.send(()).is_err() {
+                            eprintln!("Abort sender failed to send abort signal (3)")
+                        }
                         break
                     }
                 }
@@ -457,14 +520,14 @@ async fn bg_loop(
     let mut lock = status.write().await;
     *lock = ConnectionStatus::Disconnected;
     drop(lock);
-    let (write_res, mut msgrecv) = _write_res.unwrap();
+    let (write_res, mut msgrecv) = _write_res.expect("Write res should never fail");
     read_res
-        .unwrap()
+        .expect("Read res should never fail")
         .reunite(write_res)
-        .unwrap()
+        .expect("These are a matching pair this will never fail")
         .close(None)
         .await
-        .unwrap();
+        .expect("Close should never fail on the socket");
 
     // close after client status is updated so no race condition stuff
     msgrecv.close();
@@ -509,12 +572,14 @@ impl Channel {
         }
     }
 
-    pub async fn send(&self, mut msg: goval::Command) {
+    pub async fn send(&self, mut msg: goval::Command) -> Result<(), CrosisError> {
         msg.channel = self.id;
-        self.client_send.send(msg.encode_to_vec()).unwrap();
+        self.client_send.send(msg.encode_to_vec()).map_err(|_| {
+            CrosisError::GenericError(format!("Failed to send message from channel #{}", self.id))
+        })
     }
 
-    pub async fn request(&self, mut msg: goval::Command) -> goval::Command {
+    pub async fn request(&self, mut msg: goval::Command) -> Result<goval::Command, CrosisError> {
         let mut reqs = self.req_map.write().await;
 
         // This is to match @replit/crosis, might benchmark and find faster random id
@@ -526,9 +591,10 @@ impl Channel {
         reqs.insert(cmd_ref, send);
         drop(reqs);
 
-        self.send(msg).await;
+        self.send(msg).await?;
 
-        recv.await.unwrap()
+        recv.await
+            .map_err(|_| CrosisError::GenericError("Failed to recv from request".to_string()))
     }
 
     pub fn close(self) {}
@@ -537,6 +603,11 @@ impl Channel {
 // TODO: remove channel from channel map...
 impl Drop for Channel {
     fn drop(&mut self) {
+        // Dont send close channel for channel 0 thats just stupid
+        if self.id == 0 {
+            return;
+        }
+
         // Try to send close channel
         let _ = self.client_send.send(
             goval::Command {
@@ -556,14 +627,22 @@ fn generate_ref() -> String {
     let mut result = vec![];
     let mut _x = fastrand::choose_multiple(10u32.pow(8)..(10u32.pow(9) - 1), 2);
 
-    let mut x: u64 = (_x[0].to_string() + &_x[1].to_string()).parse().unwrap();
+    let mut x: u64 = (_x[0].to_string() + &_x[1].to_string())
+        .parse()
+        .expect("Ref generation should never fail");
 
     loop {
         let m = x % 36;
         x /= 36;
 
         // will panic if you use a bad radix (< 2 or > 36).
-        result.push(std::char::from_digit(m.try_into().unwrap(), 36).unwrap());
+        result.push(
+            std::char::from_digit(
+                m.try_into().expect("Failed to convert from u64 to usize"),
+                36,
+            )
+            .expect("Good radix is used"),
+        );
         if x == 0 {
             break;
         }
