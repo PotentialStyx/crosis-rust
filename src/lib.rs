@@ -289,7 +289,10 @@ impl Client {
         for (key, val) in channel_buffer.iter_mut() {
             if let Some(channel) = channel_map.get(key) {
                 while let Some(cmd) = val.pop() {
-                    channel.0.send(cmd).unwrap();
+                    // Send will not fail then work again, so skip useless work
+                    if channel.0.send(cmd).is_err() {
+                        break;
+                    }
                 }
                 remove.push(*key);
             }
@@ -531,6 +534,7 @@ impl Channel {
     pub fn close(self) {}
 }
 
+// TODO: remove channel from channel map...
 impl Drop for Channel {
     fn drop(&mut self) {
         // Try to send close channel
