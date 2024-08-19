@@ -90,6 +90,13 @@ pub struct Client {
 
     channel_map: ChanMap,
 
+    #[cfg(feature = "notif_on_close")]
+    #[readonly]
+    pub close_recv: kanal::AsyncReceiver<()>,
+
+    #[cfg(feature = "notif_on_close")]
+    close_publish: kanal::AsyncSender<()>,
+
     #[cfg(feature = "chan_buf")]
     channel_buffer: ChanBuf,
 
@@ -99,6 +106,8 @@ pub struct Client {
 
 impl Client {
     pub fn new(fetcher: Box<dyn ConnectionMetadataFetcher + Send + Sync>) -> Client {
+        #[cfg(feature = "notif_on_close")]
+        let (write, read) = kanal::unbounded_async();
         Client {
             fetcher,
             closer: None,
@@ -107,6 +116,10 @@ impl Client {
             #[cfg(feature = "chan_buf")]
             channel_buffer: Arc::new(RwLock::new(HashMap::new())),
             status: Arc::new(RwLock::new(ConnectionStatus::Disconnected)),
+            #[cfg(feature = "notif_on_close")]
+            close_publish: write,
+            #[cfg(feature = "notif_on_close")]
+            close_recv: read,
         }
     }
 
@@ -176,6 +189,8 @@ impl Client {
             connection,
             #[cfg(feature = "chan_buf")]
             self.channel_buffer.clone(),
+            #[cfg(feature = "notif_on_close")]
+            self.close_publish.clone(),
         ));
 
         loop {
@@ -357,6 +372,7 @@ async fn bg_loop(
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
     #[cfg(feature = "chan_buf")] chan_buf: ChanBuf,
+    #[cfg(feature = "notif_on_close")] close_sender: kanal::AsyncSender<()>,
 ) {
     let mut lock = status.write().await;
     // TODO: Connecting -> connected
@@ -525,13 +541,18 @@ async fn bg_loop(
     *lock = ConnectionStatus::Disconnected;
     drop(lock);
     let (write_res, mut msgrecv) = _write_res.expect("Write res should never fail");
-    read_res
+    // This can fail if server closes conn, but error can be safely ignored
+    let _ = read_res
         .expect("Read res should never fail")
         .reunite(write_res)
         .expect("These are a matching pair this will never fail")
         .close(None)
-        .await
-        .expect("Close should never fail on the socket");
+        .await;
+
+    #[cfg(feature = "notif_on_close")]
+    if let Err(err) = close_sender.send(()).await {
+        eprintln!("Close sender failed with error: {err}");
+    }
 
     // close after client status is updated so no race condition stuff
     msgrecv.close();
