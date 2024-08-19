@@ -128,6 +128,16 @@ impl Client {
     }
 
     pub async fn connect_max_retries(&mut self, max_retries: u32) -> Result<Channel, CrosisError> {
+        self.connect_max_retries_and_backoff(max_retries, 1000, 2)
+            .await
+    }
+
+    pub async fn connect_max_retries_and_backoff(
+        &mut self,
+        max_retries: u32,
+        backoff_initial: u64,
+        backoff_factor: u64,
+    ) -> Result<Channel, CrosisError> {
         let mut retries: u32 = 0;
         let connection_metadata = loop {
             break match self.fetcher.fetch().await {
@@ -141,7 +151,10 @@ impl Client {
                         if retries >= max_retries {
                             return Err(CrosisError::ConnectionMetadataFetchError);
                         }
-                        tokio::time::sleep(Duration::from_millis(10 * 10u64.pow(retries))).await;
+                        tokio::time::sleep(Duration::from_millis(
+                            backoff_initial * backoff_factor.pow(retries),
+                        ))
+                        .await;
                         retries += 1;
                         continue;
                     }
