@@ -375,6 +375,15 @@ impl Client {
     }
 }
 
+impl Drop for Client {
+    fn drop(&mut self) {
+        // Try our best to close, and avoid memory leak
+        if let Some(closer) = self.closer.as_ref() {
+            let _ = closer.send(());
+        }
+    }
+}
+
 async fn bg_loop(
     abort_sender: broadcast::Sender<()>,
     mut abort_signal: broadcast::Receiver<()>,
